@@ -41,6 +41,8 @@ std::chrono::time_point<std::chrono::system_clock> currentTime;
 vector<ControlState> cs;
 
 bool refresh_view = false;
+// Flag to select matching method. To sue ICP, press "i" before driving car.
+bool use_icp = false;
 void keyboardEventOccurred(const pcl::visualization::KeyboardEvent &event, void* viewer)
 {
 
@@ -59,6 +61,10 @@ void keyboardEventOccurred(const pcl::visualization::KeyboardEvent &event, void*
   	}
 	if(event.getKeySym() == "a" && event.keyDown()){
 		refresh_view = true;
+	}
+	if(event.getKeySym() == "i" && event.keyDown()){
+		use_icp = true;
+		cout << "ICP will be used." << endl;
 	}
 }
 
@@ -86,17 +92,59 @@ void Accuate(ControlState response, cc::Vehicle::Control& state){
 	}
 	state.steer = min( max(state.steer+response.s, -1.0f), 1.0f);
 	state.brake = response.b;
+	// Show current throttle
+	cout << "Current throttle is " << state.throttle << endl;
 }
 
 void drawCar(Pose pose, int num, Color color, double alpha, pcl::visualization::PCLVisualizer::Ptr& viewer){
 
 	BoxQ box;
 	box.bboxTransform = Eigen::Vector3f(pose.position.x, pose.position.y, 0);
-    box.bboxQuaternion = getQuaternion(pose.rotation.yaw);
-    box.cube_length = 4;
-    box.cube_width = 2;
-    box.cube_height = 2;
+	box.bboxQuaternion = getQuaternion(pose.rotation.yaw);
+	box.cube_length = 4;
+	box.cube_width = 2;
+	box.cube_height = 2;
 	renderBox(viewer, box, num, color, alpha);
+}
+
+Eigen::Matrix4d ICP(PointCloudT::Ptr target, PointCloudT::Ptr source, Pose startingPose, int iterations)
+{
+	// Defining a rotation matrix and translation vector
+	Eigen::Matrix4d transformation_matrix = Eigen::Matrix4d::Identity ();
+
+	// align source with starting pose
+	Eigen::Matrix4d initTransform = transform3D(startingPose.rotation.yaw, startingPose.rotation.pitch, startingPose.rotation.roll,
+												startingPose.position.x, startingPose.position.y, startingPose.position.z);
+	PointCloudT::Ptr transformSource (new PointCloudT); 
+	pcl::transformPointCloud(*source, *transformSource, initTransform);
+
+	pcl::IterativeClosestPoint<PointT, PointT> icp;
+	icp.setMaximumIterations(iterations);
+	icp.setInputSource(transformSource);
+	icp.setInputTarget(target);
+	icp.setMaxCorrespondenceDistance(2);
+	
+	PointCloudT::Ptr cloud_icp(new PointCloudT);  // ICP output point cloud
+	icp.align (*cloud_icp);
+	if (icp.hasConverged ())
+	{
+		transformation_matrix = icp.getFinalTransformation ().cast<double>();
+		transformation_matrix =  transformation_matrix * initTransform;
+	}
+
+	return transformation_matrix;
+}
+
+Eigen::Matrix4d NDT(pcl::NormalDistributionsTransform<pcl::PointXYZ, pcl::PointXYZ> ndt, PointCloudT::Ptr source, Pose startingPose, int iterations)
+{
+	Eigen::Matrix4f init_guess = transform3D(startingPose.rotation.yaw, startingPose.rotation.pitch, startingPose.rotation.roll,
+											startingPose.position.x, startingPose.position.y, startingPose.position.z).cast<float>();
+	ndt.setMaximumIterations(iterations);
+	ndt.setInputSource(source);
+	pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_ndt(new pcl::PointCloud<pcl::PointXYZ>);
+	ndt.align(*cloud_ndt, init_guess);
+
+	return ndt.getFinalTransformation().cast<double>();
 }
 
 int main(){
@@ -116,9 +164,9 @@ int main(){
 	auto lidar_bp = *(blueprint_library->Find("sensor.lidar.ray_cast"));
 	// CANDO: Can modify lidar values to get different scan resolutions
 	lidar_bp.SetAttribute("upper_fov", "15");
-    lidar_bp.SetAttribute("lower_fov", "-25");
-    lidar_bp.SetAttribute("channels", "32");
-    lidar_bp.SetAttribute("range", "30");
+	lidar_bp.SetAttribute("lower_fov", "-25");
+	lidar_bp.SetAttribute("channels", "32");
+	lidar_bp.SetAttribute("range", "30");
 	lidar_bp.SetAttribute("rotation_frequency", "60");
 	lidar_bp.SetAttribute("points_per_second", "500000");
 
@@ -165,6 +213,13 @@ int main(){
 	Pose poseRef(Point(vehicle->GetTransform().location.x, vehicle->GetTransform().location.y, vehicle->GetTransform().location.z), Rotate(vehicle->GetTransform().rotation.yaw * pi/180, vehicle->GetTransform().rotation.pitch * pi/180, vehicle->GetTransform().rotation.roll * pi/180));
 	double maxError = 0;
 
+	//Set resolution and point cloud target (map) for ndt
+	pcl::NormalDistributionsTransform<pcl::PointXYZ, pcl::PointXYZ> ndt;
+	ndt.setTransformationEpsilon(.0001);
+	ndt.setStepSize(1);
+	ndt.setResolution(1);
+	ndt.setInputTarget(mapCloud);
+
 	while (!viewer->wasStopped())
   	{
 		while(new_scan){
@@ -201,20 +256,37 @@ int main(){
 			
 			new_scan = true;
 			// TODO: (Filter scan using voxel filter)
+			pcl::VoxelGrid<PointT> vg;
+			vg.setInputCloud(scanCloud);
+			double filterRes = 0.5;
+			vg.setLeafSize(filterRes, filterRes, filterRes);
+			vg.filter(*cloudFiltered);
 
 			// TODO: Find pose transform by using ICP or NDT matching
 			//pose = ....
+			Eigen::Matrix4d transform;
+			if (use_icp)
+			{
+				transform = ICP(mapCloud, cloudFiltered, pose, 10);
+			}
+			else
+			{
+				transform = NDT(ndt, cloudFiltered, pose, 10);
+			}
+			pose = getPose(transform);
 
 			// TODO: Transform scan so it aligns with ego's actual pose and render that scan
+			PointCloudT::Ptr transformed_scan(new PointCloudT);
+			pcl::transformPointCloud(*cloudFiltered, *transformed_scan, transform);
 
 			viewer->removePointCloud("scan");
 			// TODO: Change `scanCloud` below to your transformed scan
-			renderPointCloud(viewer, scanCloud, "scan", Color(1,0,0) );
+			renderPointCloud(viewer, transformed_scan, "scan", Color(1,0,0) );
 
 			viewer->removeAllShapes();
 			drawCar(pose, 1,  Color(0,1,0), 0.35, viewer);
-          
-          	double poseError = sqrt( (truePose.position.x - pose.position.x) * (truePose.position.x - pose.position.x) + (truePose.position.y - pose.position.y) * (truePose.position.y - pose.position.y) );
+		  
+		  	double poseError = sqrt( (truePose.position.x - pose.position.x) * (truePose.position.x - pose.position.x) + (truePose.position.y - pose.position.y) * (truePose.position.y - pose.position.y) );
 			if(poseError > maxError)
 				maxError = poseError;
 			double distDriven = sqrt( (truePose.position.x) * (truePose.position.x) + (truePose.position.y) * (truePose.position.y) );
